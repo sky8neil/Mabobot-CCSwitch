@@ -1,0 +1,109 @@
+{
+  "name": "imagine_plus",
+  "display_name": "关键词生图（直连通道）",
+  "version": "1.0.0",
+  "description": "群聊 @机器人 或私聊命中生图关键词时，直接调用宿主图像通道出图并发送图片",
+  "author": "System",
+  "category": "image",
+  "requires": [],
+  "config_schema": {
+    "keywords": {
+      "type": "array",
+      "description": "触发直连出图的关键词列表，子串匹配且 ASCII 大小写不敏感",
+      "default": [
+        "生图",
+        "生成图片",
+        "生成一张图",
+        "生成图",
+        "文生图",
+        "画一张",
+        "画一张图",
+        "画个",
+        "画一幅",
+        "帮我画",
+        "帮忙画",
+        "出图",
+        "做个图",
+        "配张图",
+        "配图"
+      ],
+      "scope": "global",
+      "level": "hidden"
+    },
+    "default_count": {
+      "type": "integer",
+      "description": "未指定数量时默认生成的图片张数",
+      "default": 1,
+      "scope": "global",
+      "level": "basic"
+    },
+    "max_count": {
+      "type": "integer",
+      "description": "单次生成图片的最大张数",
+      "default": 4,
+      "scope": "global",
+      "level": "basic"
+    },
+    "hint_text": {
+      "type": "string",
+      "description": "命中关键词但缺少描述时回复的引导语",
+      "default": "🎨 想画什么？把描述发我，例如：@我 画一只在雨里奔跑的柯基",
+      "scope": "global",
+      "level": "basic"
+    },
+    "output_dir": {
+      "type": "string",
+      "description": "生成图片的落盘目录",
+      "default": "data/plugins/imagine_plus/out",
+      "scope": "global",
+      "level": "basic"
+    },
+    "generate_timeout_seconds": {
+      "type": "integer",
+      "description": "单次调用宿主图像通道的最长等待时间（秒）",
+      "default": 300,
+      "scope": "global",
+      "level": "basic"
+    },
+    "send_retries": {
+      "type": "integer",
+      "description": "微信发送图片失败时的重试次数",
+      "default": 3,
+      "scope": "global",
+      "level": "basic"
+    }
+  },
+  "config": {
+    "keywords": [
+      "生图",
+      "生成图片",
+      "生成一张图",
+      "生成图",
+      "文生图",
+      "画一张",
+      "画一张图",
+      "画个",
+      "画一幅",
+      "帮我画",
+      "帮忙画",
+      "出图",
+      "做个图",
+      "配张图",
+      "配图"
+    ],
+    "patterns": [
+      "(?:生成个|生成张|来张|来一张|来一幅|画个|画一张|画一幅|做个|做张)\\s*(?P<desc>.{0,24}?)\\s*(?:图片|照片|相片|图|画)",
+      "(?:生成|画|做|来|发|整|弄)\\s*(?:个|张|一张|一幅|一副)\\s*(?P<desc>.{1,24}?)\\s*(?:图片|照片|相片|图)",
+      "(?:生成|做|画|来|发|整|弄)\\s*(?P<desc>.{1,24}?)\\s*(?:图片|照片|相片|图)"
+    ],
+    "default_count": 1,
+    "max_count": 4,
+    "hint_text": "🎨 想画什么？把描述发我，例如：@我 画一只在雨里奔跑的柯基",
+    "output_dir": "data/plugins/imagine_plus/out",
+    "generate_timeout_seconds": 300,
+    "send_retries": 3
+  },
+  "runtime": {
+    "enabled": true
+  }
+}

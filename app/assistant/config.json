@@ -1,0 +1,239 @@
+{
+  "name": "assistant",
+  "component_kind": "core",
+  "display_name": "AI 助手",
+  "version": "2.0.0",
+  "description": "由 Codex 驱动的核心 AI 助手，支持角色、接话判断与原始聊天档案",
+  "author": "Project Contributors",
+  "category": "ai",
+  "requires": [
+    "openai",
+    "google-genai"
+  ],
+  "ui": {
+    "icon": "bi-robot",
+    "llm_tasks": {
+      "chat": {
+        "label": "日常对话",
+        "description": "通过 Codex 回复通道生成助手的最终回复",
+        "category": "对话",
+        "order": 0,
+        "routable": false
+      },
+      "reply_latency": {
+        "label": "回复耗时",
+        "description": "历史回复延迟记录，不计入模型用量",
+        "category": "历史记录",
+        "order": 900,
+        "routable": false
+      },
+      "judge": {
+        "label": "主动接话判断",
+        "description": "判断 AI 是否应该主动参与当前群聊",
+        "category": "对话",
+        "order": 20
+      },
+      "followup_judge": {
+        "label": "连续追问判断",
+        "description": "判断未再次 @ 的跟进消息是否应继续回复",
+        "category": "对话",
+        "order": 30
+      },
+      "content_review": {
+        "label": "微信附件内容审核",
+        "description": "审核下载文件和最终附件，拦截色情及管理员定义的政治敏感内容；需要支持图片的模型",
+        "category": "内容审核",
+        "order": 40
+      }
+    },
+    "settings_notice": "这里是 AI 助手的全局默认值。聊天卡片上的“继承全局”会自动跟随这里；聊天配置只负责少量必要的单独覆盖。",
+    "settings_groups": {
+      "reply": {
+        "title": "基础与触发",
+        "description": "选择默认角色，并决定群聊中允许哪些被动触发方式",
+        "order": 10
+      },
+      "model": {
+        "title": "Codex 回复行为",
+        "description": "仅影响使用本地 Codex 的对话路由",
+        "order": 30
+      },
+      "tools": {
+        "title": "Codex 网页搜索",
+        "description": "由 Codex 原生搜索处理聊天回复，不经过辅助模型预搜索",
+        "order": 40
+      },
+      "context": {
+        "title": "上下文与预算",
+        "description": "控制短期对话窗口、Token 预留和锚点策略",
+        "order": 50
+      }
+    }
+  },
+  "config_schema": {
+    "default_role": {
+      "type": "string",
+      "description": "默认角色名称",
+      "default": "default"
+    },
+    "codex_persistent_session_enabled": {
+      "type": "boolean",
+      "description": "Codex 回复是否按聊天对象复用持久会话",
+      "default": true,
+      "level": "hidden"
+    },
+    "codex_reasoning_effort": {
+      "type": "string",
+      "description": "Codex 推理强度覆盖；inherit 使用 Codex 运行配置",
+      "default": "inherit",
+      "enum": [
+        "inherit",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "enum_labels": {
+        "inherit": "继承 Codex 运行配置",
+        "minimal": "最低（最快）",
+        "low": "低",
+        "medium": "中",
+        "high": "高",
+        "xhigh": "超高",
+        "max": "最大（最慢）"
+      }
+    },
+    "codex_reasoning_summary": {
+      "type": "string",
+      "description": "Codex 公开推理摘要模式；inherit 使用 Codex 默认配置",
+      "default": "inherit",
+      "enum": [
+        "inherit",
+        "none",
+        "auto",
+        "concise",
+        "detailed"
+      ],
+      "enum_labels": {
+        "inherit": "继承 Codex 配置",
+        "none": "不生成摘要",
+        "auto": "自动",
+        "concise": "简洁",
+        "detailed": "详细"
+      }
+    },
+    "codex_web_search_mode": {
+      "type": "string",
+      "description": "Codex 原生 Web 搜索模式",
+      "default": "inherit",
+      "enum": [
+        "inherit",
+        "disabled",
+        "cached",
+        "indexed",
+        "live"
+      ],
+      "enum_labels": {
+        "inherit": "继承 Codex 运行配置",
+        "disabled": "禁用",
+        "cached": "缓存索引",
+        "indexed": "索引门控",
+        "live": "实时网页"
+      }
+    },
+    "codex_turn_timeout_seconds": {
+      "type": "integer",
+      "description": "后台任务也受此限制。",
+      "default": 7200,
+      "minimum": 60,
+      "maximum": 43200,
+      "title": "任务最长执行时间（秒）"
+    },
+    "codex_max_turns_per_thread": {
+      "type": "integer",
+      "description": "单个 Codex 线程最多回复轮数；0 表示不按轮数主动轮换",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "codex_exec_fallback_enabled": {
+      "type": "boolean",
+      "description": "Codex 运行时不可用时是否允许使用独立执行后端",
+      "default": true
+    },
+    "context_window_auto_detect": {
+      "type": "boolean",
+      "description": "优先读取 Codex 运行时或 LLM 模型配置中的真实上下文窗口",
+      "default": true
+    },
+    "search_enabled": {
+      "type": "boolean",
+      "description": "是否允许 Codex 在聊天回复中使用原生网页搜索",
+      "default": true
+    },
+    "allow_mention_trigger": {
+      "type": "boolean",
+      "group": "reply",
+      "description": "是否允许群聊中通过@触发被动回复",
+      "default": true
+    },
+    "proactive_interval_minutes": {
+      "type": "integer",
+      "description": "主动回复最小间隔（分钟）",
+      "default": 1
+    },
+    "proactive_msg_threshold": {
+      "type": "integer",
+      "description": "主动回复积攒消息条数阈值",
+      "default": 5
+    },
+    "proactive_judge_model": {
+      "type": "string",
+      "description": "用于判断是否插话的模型名称",
+      "default": "deepseek-chat"
+    },
+    "proactive_judge_prompt": {
+      "type": "string",
+      "description": "旧版接话规则，仅用于首次迁移；请在接话判断中编辑",
+      "default": "## Role\n你是一个谨慎的聊天群组观察员，负责判断 AI 助手是否应该参与当前对话。\n\n## Context\n以下是最近的聊天记录：\n[对话开始]\n{chat_text}\n[对话结束]\n\n## Rules\n- 明确提到机器人、请求帮助或提出适合 AI 回答的问题时，可以回复。\n- 纯表情、复读、礼貌收尾或参与会打扰正常交流时，不回复。\n- 不确定时优先不主动介入。\n\n## Output\n仅输出 JSON：\n{\n  \"atmosphere\": \"当前聊天氛围\",\n  \"should_reply\": true,\n  \"reason\": \"简短说明判断理由\"\n}"
+    },
+    "background_after_minutes": {
+      "type": "integer",
+      "title": "转后台时间（分钟）",
+      "description": "超过此时间后继续在后台执行。",
+      "default": 10,
+      "minimum": 1,
+      "maximum": 120,
+      "step": 1
+    },
+    "codex_network_wait_seconds": {
+      "type": "integer",
+      "title": "连接恢复等待（秒）",
+      "description": "连续连接异常的等待上限。",
+      "default": 1800,
+      "minimum": 30,
+      "maximum": 7200
+    }
+  },
+  "config": {
+    "default_role": "Liuju-HLS",
+    "codex_persistent_session_enabled": true,
+    "codex_reasoning_effort": "inherit",
+    "codex_reasoning_summary": "inherit",
+    "codex_web_search_mode": "live",
+    "codex_turn_timeout_seconds": 7200,
+    "codex_max_turns_per_thread": 0,
+    "codex_exec_fallback_enabled": true,
+    "context_window_auto_detect": true,
+    "search_enabled": false,
+    "allow_mention_trigger": true,
+    "proactive_interval_minutes": 1,
+    "proactive_msg_threshold": 5,
+    "proactive_judge_model": "deepseek-chat",
+    "proactive_judge_prompt": "## Role\n你是一个谨慎的聊天群组观察员，负责判断 AI 助手是否应该参与当前对话。\n\n## Context\n以下是最近的聊天记录：\n[对话开始]\n{chat_text}\n[对话结束]\n\n## Rules\n- 明确提到机器人、请求帮助或提出适合 AI 回答的问题时，可以回复。\n- 纯表情、复读、礼貌收尾或参与会打扰正常交流时，不回复。\n- 不确定时优先不主动介入。\n\n## Output\n仅输出 JSON：\n{\n  \"atmosphere\": \"当前聊天氛围\",\n  \"should_reply\": true,\n  \"reason\": \"简短说明判断理由\"\n}",
+    "background_after_minutes": 10,
+    "codex_network_wait_seconds": 1800
+  }
+}

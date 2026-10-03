@@ -1,0 +1,13 @@
+{
+    "enabled":  true,
+    "bridge_status_url":  "http://127.0.0.1:5555/api/status",
+    "app_status_url":  "http://127.0.0.1:21889/api/system/status",
+    "chrome_debug_port":  19223,
+    "interval_seconds":  1800,
+    "idle_grace_seconds":  120,
+    "max_close_per_run":  20,
+    "request_timeout_seconds":  3,
+    "chrome_max_tabs":  1,
+    "log_file":  "C:\\Users\\mabobot\\Mabobot\\logs\\cleanup.log",
+    "wmpf_history_glob":  "%APPDATA%\\Tencent\\xwechat\\radium\\web\\profiles\\*\\History"
+}

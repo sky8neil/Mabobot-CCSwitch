@@ -1,0 +1,34 @@
+# 图片编辑
+
+使用**全局默认 Codex Profile** 的官方 ChatGPT 登录，在一次独立 `codex exec --ephemeral` 进程中完成图片编辑或生成。每次任务重新读取默认 Profile，继承其模型和认证，不使用聊天绑定的 Profile，也不复用聊天进程或历史。需要该 Profile 的 Codex 环境具有真实生图能力。
+
+## 生图通道
+
+插件支持两种生图通道，任务执行时按可用性自动选择：
+
+1. **官方 Codex 原生 image_gen**：使用全局默认 Codex Profile 的官方 ChatGPT 登录（`auth_type=chatgpt`），在一次独立 `codex exec --ephemeral` 进程中完成编辑或生成，需要该 Profile 具备真实生图能力。
+2. **宿主第三方 OpenAI 兼容图像接口**：当接口地址与密钥都非空时优先使用，调用 `POST {BASE}/v1/images/generations`（`response_format` 固定为 `b64_json`），支持无参考图生图与多张参考图改图/合并。配置项查找顺序为 settings 表优先、其次环境变量：
+   - `MABOBOT_IMAGE_API_BASE`（回退 `SUBAPI_API_BASE`，默认 `https://subapi.803866.xyz`）
+   - `MABOBOT_IMAGE_API_KEY`（回退 `SUBAPI_API_KEY`）
+   - `MABOBOT_IMAGE_MODEL`（默认 `grok-imagine-image-2.0`）
+   - `MABOBOT_IMAGE_QUALITY`（默认 `medium`）
+   - `MABOBOT_IMAGE_TIMEOUT`（默认 300 秒）
+
+   BASE 与 KEY 都非空时走第三方接口，否则回退官方 Codex 通道。
+
+- `P图 修改描述`：收集 1 张参考图后编辑。
+- `P图2 合成描述`：收集 2 张参考图，一次传入同一个任务。
+- `P图0 图片描述`：无需参考图，直接生图。
+- `P图2 +3 合成描述`：使用 2 张参考图，目标生成 3 张；实际产生的完整中间版本也会发送。
+
+保留引用图片、后续补充描述和收集超时流程。`target_images` 默认 1；`processing_timeout` 控制单次 Codex 执行超时，默认 300 秒。超时后由现有 Codex 客户端终止进程树，不自动重新发起生图。
+
+未配置默认 Profile、未完成登录或默认 Profile 使用 API Key 时，会报告错误。Gemini/APIQIK 模式及配置已移除，不再需要它们的密钥、R2 上传或专用依赖。生成图片保存在插件标准 generated 存储目录中的 `images/<任务ID>/artifacts/` 下，发送后保留，避免微信尚未读完文件。
+
+任务执行时实时读取 Codex 事件，并约每秒检查本次线程的生成目录和附件目录。图片大小与修改时间稳定、格式及解码检查通过后，按内容哈希保存独立副本并排队发送。微信发送不会阻塞进程输出读取；最终附件与已发送版本按哈希去重。所有完整版本均发送，不以 `+数量` 截断；损坏或尚未写完的图片会继续等待。
+
+任务记录新增 `image_discovered`（含源文件修改时间与发现时间）、`image_send_started`、`image_sent`、`image_send_failed` 和工具事件类型记录。任务超时或失败时，已捕获的图片仍保留并完成发送队列。`generated_at` 取文件修改时间，是落盘时间的近似值。
+
+生图完成后的文件查找、复制和发送由宿主完成，Codex 无需为交付图片执行额外命令。已成功发送至少一张图片后，后续进程超时只记后台日志；尚未发送任何图片时仍提示超时失败。任务记录保留真实的进程超时状态，不将超时改写为正常退出。
+
+命令事件实时保存命令内容（最多 4096 字符）、退出码、状态，以及输出尾部和错误摘要（各最多 2048 字符），并遮蔽常见内联凭据。即使任务超时，也可从 `codex_item_observed` 事件查看已执行命令；这些诊断信息不会发送到微信群。

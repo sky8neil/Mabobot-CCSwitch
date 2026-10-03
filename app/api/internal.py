@@ -1,0 +1,483 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+内部API - 用于服务间通信
+"""
+
+import logging
+import re
+import threading
+import time
+from collections import OrderedDict
+from datetime import datetime
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from typing import Optional
+
+from app.core.event_bus import EventBus, Event, EventType
+from app.dependencies import get_event_bus_instance, get_wechat_manager_instance
+from app.core.wechat_manager import WeChatManager
+from app.models.base import SessionLocal
+from app.models.user_permission import WeChatUser, UserPermission
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# 无协议头裸链接（必须带 / 路径段），避免把 bilibili.com 这类裸域名当链接。
+_BARE_LINK_RE = re.compile(
+    r"(?<![\w@.])((?:[\w-]+\.)+(?:com|cn|net|org|io|me|tv|cc|xyz|top|site|vip|info|biz|co|jp|us)/[^\s\u4e00-\u9fff]{1,})",
+    re.IGNORECASE,
+)
+
+def check_summary_permission(chat_name: str) -> bool:
+    """Read only the grant names; unrelated schema migrations must not affect access."""
+    try:
+        with SessionLocal() as db:
+            grants = db.query(UserPermission.plugin_name).join(
+                WeChatUser, UserPermission.user_id == WeChatUser.id
+            ).filter(WeChatUser.chat_name == chat_name).all()
+            return any(
+                str(name).rsplit("/", 1)[-1] in {"builtin_summary", "summary_plus"}
+                for (name,) in grants
+            )
+    except Exception as exc:
+        logger.warning("检查摘要权限失败，拒绝摘要处理: %s", exc)
+        return False
+
+
+
+# R-B 链接卡片降级兜底：URL 解析失败时补发合成文本事件的去重状态（内存 LRU，上限 500）。
+_LINK_FALLBACK_MARKER = "[链接卡片·内容未能解析]"
+_LINK_FALLBACK_SEEN: "OrderedDict[tuple, float]" = OrderedDict()
+_LINK_FALLBACK_SEEN_MAX = 500
+_LINK_FALLBACK_LOCK = threading.Lock()
+
+
+def _link_fallback_key(message: "WeChatMessage") -> tuple:
+    """按 (chat_name, message_id) 去重；无 message_id 时退化到内容指纹。"""
+    message_id = str(message.message_id or "").strip()
+    if message_id:
+        return (message.chat_name, message_id)
+    return (message.chat_name, f"__no_id__:{message.sender}:{message.content}")
+
+
+def _link_fallback_already_sent(key: tuple) -> bool:
+    """记录并判断是否已补发过；命中时返回 True 并刷新 LRU。"""
+    if key in _LINK_FALLBACK_SEEN:
+        _LINK_FALLBACK_SEEN.move_to_end(key)
+        return True
+    _LINK_FALLBACK_SEEN[key] = time.time()
+    while len(_LINK_FALLBACK_SEEN) > _LINK_FALLBACK_SEEN_MAX:
+        _LINK_FALLBACK_SEEN.popitem(last=False)
+    return False
+
+
+def _link_fallback_content(message: "WeChatMessage") -> str:
+    """生成带检索标记的合成文本；标题/可见文本缺失时用（无标题）。"""
+    visible = (message.content or "").strip()
+    if visible.startswith("[链接]"):
+        visible = visible[len("[链接]"):].strip()
+    if not visible:
+        visible = "（无标题）"
+    return f"{_LINK_FALLBACK_MARKER} {visible}"
+
+
+def _link_fallback_event(message: "WeChatMessage", content: str) -> Event:
+    """构造与真实 TEXT_MESSAGE_RECEIVED 同构的合成事件。"""
+    return Event(
+        type=EventType.TEXT_MESSAGE_RECEIVED,
+        source="wx_bot_internal_fallback",
+        data={
+            "message": content,
+            "archive_message_id": message.archive_message_id,
+            "archive_source": message.archive_source,
+            "sender": message.sender,
+            "sender_id": message.sender_id,
+            "sender_remark": message.sender_remark,
+            "chat_name": message.chat_name,
+            "chat_type": "group" if message.is_group else "user",
+            "message_type": "text",
+            "message_id": message.message_id,
+            "url": None,
+            "quote_image_path": message.quote_image_path,
+            "quote_nickname": message.quote_nickname,
+            "quote_content": message.quote_content,
+            "has_quote_image": message.has_quote_image,
+            "quote_video_path": message.quote_video_path,
+            "has_quote_video": message.has_quote_video,
+            "file_id": message.file_id,
+            "file_name": message.file_name,
+            "file_path": message.file_path,
+            "file_size": message.file_size,
+            "file_sha256": message.file_sha256,
+            "file_status": message.file_status,
+            "file_error": message.file_error,
+            "has_quote_file": message.has_quote_file,
+            "quoted_file_id": message.quoted_file_id,
+            "quoted_file_name": message.quoted_file_name,
+            "quoted_file_path": message.quoted_file_path,
+            "quoted_file_size": message.quoted_file_size,
+            "quoted_file_sha256": message.quoted_file_sha256,
+            "quoted_file_status": message.quoted_file_status,
+            "quoted_file_candidate_count": message.quoted_file_candidate_count,
+            "quoted_file_error": message.quoted_file_error,
+            "is_tickle": message.is_tickle,
+            "tickle_from": message.tickle_from,
+            "tickle_to": message.tickle_to,
+            "tickle_suffix": message.tickle_suffix,
+            "timestamp": message.timestamp,
+        },
+    )
+
+
+async def _publish_link_fallback_if_needed(
+    event_bus, wechat_manager, message: "WeChatMessage", event_type, carried_url
+) -> bool:
+    """无可用 URL 的链接卡片额外补发一条合成文本事件（幂等，最多 1 次）。"""
+    if event_type != EventType.LINK_MESSAGE_RECEIVED:
+        return False
+    if isinstance(carried_url, str) and carried_url.startswith("http"):
+        return False
+
+    key = _link_fallback_key(message)
+    with _LINK_FALLBACK_LOCK:
+        if _link_fallback_already_sent(key):
+            logger.debug("🔁 链接卡片降级文本事件已补发过，跳过: %s", key)
+            return False
+
+    fallback_event = _link_fallback_event(message, _link_fallback_content(message))
+    fallback_event.context = {"wx": wechat_manager}
+    await event_bus.publish_async(fallback_event)
+    logger.warning(
+        "🪂 链接卡片无可用URL，已补发合成文本事件: chat=%s msg=%s",
+        message.chat_name,
+        message.message_id,
+    )
+    return True
+
+
+async def _safe_publish_link_fallback(
+    event_bus, wechat_manager, message: "WeChatMessage", event_type, carried_url
+) -> bool:
+    """R-B 兜底包装：任何异常只记 warning，绝不影响原链接事件发布。"""
+    try:
+        return await _publish_link_fallback_if_needed(
+            event_bus, wechat_manager, message, event_type, carried_url
+        )
+    except Exception as exc:
+        logger.warning("⚠️ 链接卡片降级文本事件发布失败（已忽略，不影响原事件）: %s", exc)
+        return False
+
+
+class WeChatMessage(BaseModel):
+    content: str
+    sender: str
+    sender_id: Optional[str] = None
+    sender_remark: Optional[str] = None
+    chat_name: str
+    is_group: bool
+    type: str
+    mtype: str
+    message_id: Optional[str] = None
+    url: Optional[str] = None
+    quote_image_path: Optional[str] = None
+    quote_nickname: Optional[str] = None
+    quote_content: Optional[str] = None
+    has_quote_image: Optional[bool] = False
+    quote_video_path: Optional[str] = None
+    has_quote_video: Optional[bool] = False
+    file_id: Optional[str] = None
+    file_name: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    file_sha256: Optional[str] = None
+    file_status: Optional[str] = None
+    file_error: Optional[str] = None
+    has_quote_file: Optional[bool] = False
+    quoted_file_id: Optional[str] = None
+    quoted_file_name: Optional[str] = None
+    quoted_file_path: Optional[str] = None
+    quoted_file_size: Optional[int] = None
+    quoted_file_sha256: Optional[str] = None
+    quoted_file_status: Optional[str] = None
+    quoted_file_candidate_count: Optional[int] = 0
+    quoted_file_error: Optional[str] = None
+    is_tickle: bool = False
+    tickle_from: Optional[str] = None
+    tickle_to: Optional[str] = None
+    tickle_suffix: Optional[str] = None
+    timestamp: float
+    sent_at: Optional[float] = None
+    archive_only: bool = False
+    archive_message_id: Optional[str] = None
+    archive_source: Optional[str] = None
+
+@router.post("/wechat_message")
+async def receive_wechat_message(
+    message: WeChatMessage,
+    event_bus: EventBus = Depends(get_event_bus_instance),
+    wechat_manager: WeChatManager = Depends(get_wechat_manager_instance)
+):
+    """接收来自wx_bot的消息并发布到事件总线"""
+    logger.debug(f"Received internal message from wx_bot: {message.content[:50]}")
+
+    if not event_bus or not wechat_manager:
+        logger.error("Event bus or WeChat manager not available")
+        return {"status": "error", "message": "Core components not available"}
+
+    # Old deliveries are archived directly, before even the generic quote event.
+    # Do not invoke logger plugin handlers: image enrichment can download media.
+    if message.archive_only or (message.sent_at is not None and time.time() - message.sent_at > 600):
+        from app.assistant.chat_log import ChatLogManager
+        row_id = ChatLogManager().save_message(
+            message.chat_name, message.sender, message.content,
+            sender_id=message.sender_id or '', sender_remark=message.sender_remark or '',
+            message_type=message.mtype,
+            source_message_id=message.archive_message_id or '',
+            source_id_namespace=message.archive_source or 'wx_action',
+            occurred_at=datetime.fromtimestamp(message.sent_at).strftime('%Y-%m-%d %H:%M:%S') if message.sent_at is not None else '',
+            received_at=datetime.fromtimestamp(message.timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+            metadata={"archive_only": True, "quote_nickname": message.quote_nickname,
+                      "quote_content": message.quote_content},
+        )
+        if not row_id:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=500, detail='积压消息存档失败')
+        logger.info("积压消息仅存档，跳过自动处理: chat=%r sent_at=%r", message.chat_name, message.sent_at)
+        return {"status": "success", "archive_only": True}
+
+    # 根据消息类型确定事件类型
+    # 优先根据显式URL判断为链接事件；其次检查mtype
+    _bare_link_match = _BARE_LINK_RE.search(message.content or "")
+    is_link_message = (message.url and isinstance(message.url, str) and message.url.startswith('http')) \
+        or message.mtype == 'link' \
+        or 'http' in message.content \
+        or (message.type == 'other' and (message.content.strip().startswith('[链接]'))) \
+        or bool(_bare_link_match)
+
+    # 无协议头裸链接命中时，补全为 https:// 并随事件携带；允许时写回 message.url。
+    _carried_url = message.url
+    if _bare_link_match and not (
+        isinstance(_carried_url, str) and _carried_url.startswith('http')
+    ):
+        _carried_url = 'https://' + _bare_link_match.group(1)
+        try:
+            message.url = _carried_url
+        except Exception:
+            pass
+
+    if message.is_tickle:
+        event_type = EventType.TICKLE_MESSAGE_RECEIVED
+    elif is_link_message:
+        # 对于链接消息，先检查用户是否启用了摘要功能
+        if check_summary_permission(message.chat_name):
+            event_type = EventType.LINK_MESSAGE_RECEIVED
+            logger.info(f"🔗 检测到URL内容，用户已启用摘要功能，发布LINK_MESSAGE_RECEIVED事件")
+        else:
+            logger.info(f"🔗 检测到URL内容，但聊天 '{message.chat_name}' 未启用摘要功能，跳过链接事件发布")
+            # 将链接消息当作普通文本消息处理
+            event_type = EventType.TEXT_MESSAGE_RECEIVED
+    elif message.mtype == 'text':
+        event_type = EventType.TEXT_MESSAGE_RECEIVED
+    elif message.mtype == 'image':
+        event_type = EventType.IMAGE_MESSAGE_RECEIVED
+    elif message.mtype == 'quote':
+        # 细分引用消息类型
+        quote_content = message.quote_content or ""
+        if message.has_quote_video or "[视频]" in quote_content:
+            event_type = EventType.QUOTE_VIDEO_MESSAGE_RECEIVED
+        elif "[图片]" in quote_content:
+            event_type = EventType.QUOTE_IMAGE_MESSAGE_RECEIVED
+        else:
+            event_type = EventType.QUOTE_TEXT_MESSAGE_RECEIVED
+
+        # 同时发送通用的QUOTE事件以保持向后兼容
+        general_quote_event = Event(
+            type=EventType.QUOTE_MESSAGE_RECEIVED,
+            source="wx_bot_internal",
+            data={
+                "message": message.content,
+                "archive_message_id": message.archive_message_id,
+                "archive_source": message.archive_source,
+                "sender": message.sender,
+                "sender_id": message.sender_id,
+                "sender_remark": message.sender_remark,
+                "chat_name": message.chat_name,
+                "chat_type": "group" if message.is_group else "user",
+                "message_type": message.mtype,
+                "message_id": message.message_id,
+                "url": message.url,
+                "quote_image_path": message.quote_image_path,
+                "quote_nickname": message.quote_nickname,
+                "quote_content": message.quote_content,
+                "has_quote_image": message.has_quote_image,
+                "quote_video_path": message.quote_video_path,
+                "has_quote_video": message.has_quote_video,
+                "has_quote_file": message.has_quote_file,
+                "quoted_file_id": message.quoted_file_id,
+                "quoted_file_name": message.quoted_file_name,
+                "quoted_file_path": message.quoted_file_path,
+                "quoted_file_size": message.quoted_file_size,
+                "quoted_file_sha256": message.quoted_file_sha256,
+                "quoted_file_status": message.quoted_file_status,
+                "quoted_file_candidate_count": message.quoted_file_candidate_count,
+                "quoted_file_error": message.quoted_file_error,
+                "timestamp": message.timestamp
+            },
+            context={
+                "wx": wechat_manager
+            }
+        )
+        await event_bus.publish_async(general_quote_event)
+    elif message.mtype == 'emotion':
+        event_type = EventType.EMOTION_MESSAGE_RECEIVED
+    elif message.mtype == 'voice':
+        event_type = EventType.VOICE_MESSAGE_RECEIVED
+    elif message.mtype == 'video':
+        event_type = EventType.VIDEO_MESSAGE_RECEIVED
+    elif message.mtype == 'file':
+        event_type = EventType.FILE_MESSAGE_RECEIVED
+    elif message.mtype == 'location':
+        event_type = EventType.LOCATION_MESSAGE_RECEIVED
+    elif message.mtype == 'merge':
+        event_type = EventType.MERGE_MESSAGE_RECEIVED
+    elif message.mtype == 'personal_card':
+        event_type = EventType.PERSONAL_CARD_MESSAGE_RECEIVED
+    elif message.mtype == 'note':
+        event_type = EventType.NOTE_MESSAGE_RECEIVED
+    elif message.mtype in {'other', 'miniapp', 'official', 'time', 'system'}:
+        # mabowx 的公开类型集合比业务事件集合更细。当前没有这些类型的
+        # 专用插件事件，显式归一化为 OTHER，避免把“已识别但暂无专用消费者”误报为
+        # 未知类型；原始 message_type 仍保留在 event.data 中供后续升级使用。
+        event_type = EventType.OTHER_MESSAGE_RECEIVED
+    else:
+        # 对于未知类型，发布通用OTHER事件而不是默认为TEXT
+        logger.warning(f"未知消息类型 '{message.mtype}', 发布为OTHER_MESSAGE_RECEIVED事件")
+        event_type = EventType.OTHER_MESSAGE_RECEIVED
+
+    event = Event(
+        type=event_type,
+        source="wx_bot_internal",
+        data={
+            "message": message.content,
+            "archive_message_id": message.archive_message_id,
+            "archive_source": message.archive_source,
+            "sender": message.sender,
+            "sender_id": message.sender_id,
+            "sender_remark": message.sender_remark,
+            "chat_name": message.chat_name,
+            "chat_type": "group" if message.is_group else "user",
+            "message_type": message.mtype,
+            "message_id": message.message_id,
+            "url": _carried_url,
+            "quote_image_path": message.quote_image_path,
+            "quote_nickname": message.quote_nickname,
+            "quote_content": message.quote_content,
+            "has_quote_image": message.has_quote_image,
+            "quote_video_path": message.quote_video_path,
+            "has_quote_video": message.has_quote_video,
+            "file_id": message.file_id,
+            "file_name": message.file_name,
+            "file_path": message.file_path,
+            "file_size": message.file_size,
+            "file_sha256": message.file_sha256,
+            "file_status": message.file_status,
+            "file_error": message.file_error,
+            "has_quote_file": message.has_quote_file,
+            "quoted_file_id": message.quoted_file_id,
+            "quoted_file_name": message.quoted_file_name,
+            "quoted_file_path": message.quoted_file_path,
+            "quoted_file_size": message.quoted_file_size,
+            "quoted_file_sha256": message.quoted_file_sha256,
+            "quoted_file_status": message.quoted_file_status,
+            "quoted_file_candidate_count": message.quoted_file_candidate_count,
+            "quoted_file_error": message.quoted_file_error,
+            "is_tickle": message.is_tickle,
+            "tickle_from": message.tickle_from,
+            "tickle_to": message.tickle_to,
+            "tickle_suffix": message.tickle_suffix,
+            "timestamp": message.timestamp
+        },
+        context={
+            "wx": wechat_manager
+        }
+    )
+
+    # 异步发布事件，避免阻塞请求
+    await event_bus.publish_async(event)
+
+    # R-B 降级兜底：链接事件拿不到 URL 时额外补发合成文本事件，
+    # 保证助手至少能收到“内容未能解析”的提示，而不是完全沉默。
+    # 包装函数内部已吞掉一切异常，绝不影响上面原链接事件的发布。
+    await _safe_publish_link_fallback(
+        event_bus, wechat_manager, message, event_type, _carried_url
+    )
+
+    # 更新WeChatManager统计信息
+    if wechat_manager:
+        wechat_manager._stats['messages_received'] += 1
+        wechat_manager._stats['last_message_time'] = message.timestamp
+
+        # 更新聊天统计
+        if message.chat_name in wechat_manager._listened_chats:
+            wechat_manager._listened_chats[message.chat_name]['message_count'] += 1
+
+    logger.info(f"Published {event.type.value} event for chat: {message.chat_name}")
+
+    # 添加调试信息：检查用户权限
+    from app.models.user_permission import WeChatUser
+    from app.models.base import SessionLocal
+
+    try:
+        db = SessionLocal()
+        user = db.query(WeChatUser).filter(WeChatUser.chat_name == message.chat_name).first()
+        if user:
+            plugin_permissions = [p.plugin_name for p in user.permissions]
+            logger.info(f"🔧 User '{message.chat_name}' has permissions: {plugin_permissions}")
+        else:
+            logger.warning(f"⚠️ User '{message.chat_name}' not found in permissions table!")
+    except Exception as e:
+        logger.error(f"Error checking user permissions: {e}")
+    finally:
+        db.close()
+
+    return {"status": "success"}
+
+@router.get("/connectivity/websearch")
+async def test_websearch_connectivity():
+    """测试内置 DDGS 搜索工具，不再依赖独立搜索模型映射。"""
+    import asyncio
+    import time
+
+    from app.services.local_web_search import LocalWebSearchService
+
+    service = LocalWebSearchService(
+        timeout_seconds=10,
+        max_results=1,
+        fetch_max_pages=0,
+    )
+    started_at = time.perf_counter()
+    try:
+        results = await asyncio.to_thread(
+            service.search,
+            ["DDGS connectivity test"],
+            fetch_pages=False,
+        )
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return {
+            "status": "success",
+            "provider": "ddgs",
+            "ok": bool(results),
+            "latency_ms": latency_ms,
+            "result_count": len(results),
+            "message": "Success" if results else "DDGS 未返回结果",
+        }
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return {
+            "status": "error",
+            "provider": "ddgs",
+            "ok": False,
+            "latency_ms": latency_ms,
+            "message": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }

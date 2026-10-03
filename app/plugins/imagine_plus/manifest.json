@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "plugin_api_version": 2,
+  "storage": {
+    "cache_retention_days": 7,
+    "cache_limit_mb": 2048
+  },
+  "backup": {
+    "schema_version": 1,
+    "include_persistent_storage": true,
+    "include_generated_files": true,
+    "supports_restore_migration": true,
+    "sensitive": false
+  },
+  "health": {
+    "critical": false,
+    "timeout_seconds": 5
+  },
+  "listeners": [
+    {
+      "event": "text_message_received",
+      "handler": "handle_text_message",
+      "title": "关键词直连出图",
+      "trigger": {
+        "kind": "keyword",
+        "summary": "群聊 @机器人 或私聊命中生图关键词时直接调用宿主图像通道出图",
+        "config_keys": ["keywords", "default_count", "max_count"],
+        "conditions": ["群聊必须 @机器人，私聊不需要 @", "命中关键词后由插件提取提示词与数量"]
+      },
+      "scope": {
+        "level": "global",
+        "chat_types": ["group", "user"]
+      },
+      "propagation": "stop_on_consumed"
+    }
+  ],
+  "jobs": []
+}
